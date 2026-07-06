@@ -428,7 +428,6 @@ def embed_html(video_id: str, autoplay: bool = True, theater: bool = False,
     params = urllib.parse.urlencode({
         "autoplay": int(autoplay), "rel": 0,
         "modestbranding": 1, "enablejsapi": 1,
-        "origin": "https://youtube-player.streamlit.app",
         "start": start,
         "loop": int(loop),
         "playlist": video_id if loop else "",
