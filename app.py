@@ -521,14 +521,17 @@ def get_short_url(video_id: str, yt_url: str) -> str:
     return yt_url
 
 def make_qr_b64(url: str) -> str:
+    return base64.b64encode(make_qr_png(url)).decode()
+
+def make_qr_png(url: str) -> bytes:
     qr = qrcode.QRCode(version=1, box_size=6, border=2,
-                       error_correction=qrcode.constants.ERROR_CORRECT_L)
+                       error_correction=qrcode.constants.ERROR_CORRECT_M)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="#6c63ff", back_color="#0d0d0f" if st.session_state.dark_mode else "#ffffff")
+    img = qr.make_image(fill_color="#111111", back_color="#ffffff")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+    return buf.getvalue()
 
 def fmt_count(n):
     n = int(n)
@@ -570,6 +573,7 @@ def export_history_csv() -> bytes:
 def play_video(vid_id: str, title: str):
     st.session_state.playing_id = vid_id
     st.session_state.playing_title = title
+    st.session_state.scroll_to_player = True
     st.session_state.watch_count += 1
     if vid_id not in [h[0] for h in st.session_state.history]:
         st.session_state.history.insert(0, (vid_id, title))
@@ -899,6 +903,16 @@ if st.session_state.playing_id:
     vid  = st.session_state.playing_id
     start_t = st.session_state.get("start_t", 0)
     _render_share = False
+    st.markdown('<div id="tubeplay-player"></div>', unsafe_allow_html=True)
+    if st.session_state.pop("scroll_to_player", False):
+        st.markdown("""
+        <script>
+        setTimeout(function() {
+          var player = window.parent.document.getElementById('tubeplay-player');
+          if (player) player.scrollIntoView({behavior: 'smooth', block: 'start'});
+        }, 120);
+        </script>
+        """, unsafe_allow_html=True)
 
     if st.session_state.theater_mode:
         st.markdown(embed_html(vid, theater=True,
@@ -996,6 +1010,7 @@ if st.session_state.playing_id:
                 if st.button("🔗 Get Short URL (TinyURL)", key="tinyurl_btn"):
                     with st.spinner("Shortening…"):
                         short = get_short_url(vid, yt_url)
+                    st.session_state.short_url_cache[vid] = short
                     st.markdown(f'<div class="share-link-box">{short}</div>', unsafe_allow_html=True)
                     st.markdown(f'<button onclick="copyToClipboard(\'{short}\')" style="background:{ACCENT};color:#fff;border:none;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:{FS_SMALL};margin-top:4px">📋 Copy short URL</button>', unsafe_allow_html=True)
 
@@ -1005,8 +1020,17 @@ if st.session_state.playing_id:
 
             with sc_qr:
                 st.markdown(f"<p style='font-size:{FS_META};font-weight:600;color:{TEXT}'>QR Code</p>", unsafe_allow_html=True)
-                qr_b64 = make_qr_b64(yt_url)
-                st.markdown(f'<img src="data:image/png;base64,{qr_b64}" style="width:140px;border-radius:8px">', unsafe_allow_html=True)
+                qr_target = st.session_state.short_url_cache.get(vid, yt_url)
+                qr_png = make_qr_png(qr_target)
+                st.image(qr_png, width=150)
+                st.caption("Scans to: " + qr_target)
+                st.download_button(
+                    "Download QR PNG",
+                    data=qr_png,
+                    file_name=f"tubeplay-{vid}-qr.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
 
             # Share buttons row
             sb1, sb2, sb3, sb4 = st.columns(4)
