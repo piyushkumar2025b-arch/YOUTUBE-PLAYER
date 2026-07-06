@@ -425,13 +425,15 @@ def get_video_info(video_id: str, api_key: str):
 
 def embed_html(video_id: str, autoplay: bool = True, theater: bool = False,
                speed: float = 1.0, volume: int = 100, start: int = 0, loop: bool = False) -> str:
-    params = urllib.parse.urlencode({
+    player_params = {
         "autoplay": int(autoplay), "rel": 0,
         "modestbranding": 1, "enablejsapi": 1,
         "start": start,
         "loop": int(loop),
-        "playlist": video_id if loop else "",
-    })
+    }
+    if loop:
+        player_params["playlist"] = video_id
+    params = urllib.parse.urlencode(player_params)
     cls = "player-wrap-theater" if theater else "player-wrap"
     yt_direct = f"https://www.youtube.com/watch?v={video_id}"
     # Speed/volume via postMessage; also detect embedding-blocked errors and show fallback
@@ -852,9 +854,7 @@ if st.session_state.watch_count > 0 or st.session_state.queue or st.session_stat
     </div>
     """, unsafe_allow_html=True)
 
-# Mini player overlay
-if st.session_state.mini_player and st.session_state.playing_id and not st.session_state.theater_mode:
-    st.markdown(mini_player_html(st.session_state.playing_id, st.session_state.playing_title), unsafe_allow_html=True)
+# Mini player overlay disabled so playback stays in the main allotted player area.
 
 # ── Welcome screen (no video playing, no search results) ──
 if not st.session_state.playing_id and not st.session_state.search_results:
