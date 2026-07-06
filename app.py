@@ -428,18 +428,23 @@ def embed_html(video_id: str, autoplay: bool = True, theater: bool = False,
     params = urllib.parse.urlencode({
         "autoplay": int(autoplay), "rel": 0,
         "modestbranding": 1, "enablejsapi": 1,
+        "origin": "https://youtube-player.streamlit.app",
         "start": start,
         "loop": int(loop),
         "playlist": video_id if loop else "",
     })
     cls = "player-wrap-theater" if theater else "player-wrap"
-    # Speed and volume are set via postMessage after load
+    yt_direct = f"https://www.youtube.com/watch?v={video_id}"
+    # Speed/volume via postMessage; also detect embedding-blocked errors and show fallback
     speed_vol_js = f"""
 <script>
 (function() {{
+  var cls = '{cls}';
+  var vid = '{video_id}';
+  var ytDirect = 'https://www.youtube.com/watch?v=' + vid;
   var attempts = 0;
   function trySetup() {{
-    var iframe = document.querySelector('.{cls} iframe');
+    var iframe = document.querySelector('.' + cls + ' iframe');
     if (!iframe) {{ if (attempts++ < 20) setTimeout(trySetup, 500); return; }}
     iframe.addEventListener('load', function() {{
       setTimeout(function() {{
@@ -450,6 +455,26 @@ def embed_html(video_id: str, autoplay: bool = True, theater: bool = False,
       }}, 1200);
     }});
   }}
+  // YouTube iframe API error handler — error 150/101 = embedding not allowed
+  window.addEventListener('message', function(e) {{
+    if (!e.data) return;
+    try {{
+      var d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+      if (d.event === 'infoDelivery' && d.info && d.info.playerState === 5) return;
+      if (d.event === 'onError' && (d.info === 150 || d.info === 101 || d.info === 100)) {{
+        var wrap = document.querySelector('.' + cls);
+        if (wrap && !wrap.dataset.fallbackShown) {{
+          wrap.dataset.fallbackShown = '1';
+          wrap.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:#0d0d0f;border-radius:16px;padding:32px;text-align:center;gap:16px">'
+            + '<div style="font-size:2.5em">🚫</div>'
+            + '<div style="color:#e8e8e8;font-size:15px;font-weight:600">Embedding disabled for this video</div>'
+            + '<div style="color:#888;font-size:13px">The uploader has restricted embedding on third-party sites.</div>'
+            + '<a href="' + ytDirect + '" target="_blank" style="margin-top:8px;background:#ff0000;color:#fff;text-decoration:none;padding:10px 24px;border-radius:8px;font-weight:700;font-size:14px">▶ Watch on YouTube</a>'
+            + '</div>';
+        }}
+      }}
+    }} catch(err) {{}}
+  }});
   trySetup();
 }})();
 </script>"""
@@ -517,15 +542,19 @@ def like_ratio_bar_html(stats: dict) -> str:
     # YouTube removed public dislike counts; we show likes / views ratio instead
     views    = int(stats.get("viewCount", 1))
     ratio    = min(likes / max(views, 1) * 100 * 10, 100)  # scaled for visibility
-    return f"""
-    <div class="ratio-bar-wrap">
-      <div style="font-size:{FS_SMALL};color:{MUTED};margin-bottom:3px">👍 Engagement ratio</div>
-      <div class="ratio-bar-bg"><div class="ratio-bar-fill" style="width:{ratio:.1f}%"></div></div>
-      <div class="ratio-labels">
-        <span>👍 {fmt_count(likes)}</span>
-        <span>👁 {fmt_count(views)} views</span>
-      </div>
-    </div>"""
+    likes_fmt = fmt_count(likes)
+    views_fmt = fmt_count(views)
+    # Use inline styles only (no CSS classes) so this safely embeds inside other f-strings
+    return (
+        f'<div style="margin:8px 0 4px">'
+        f'<div style="font-size:{FS_SMALL};color:{MUTED};margin-bottom:3px">👍 Engagement ratio</div>'
+        f'<div style="height:6px;background:{BORDER2};border-radius:3px;overflow:hidden">'
+        f'<div style="height:100%;width:{ratio:.1f}%;background:{ACCENT};border-radius:3px;transition:width 0.5s ease"></div>'
+        f'</div>'
+        f'<div style="display:flex;justify-content:space-between;font-size:{FS_SMALL};color:{MUTED};font-family:JetBrains Mono,monospace;margin-top:3px">'
+        f'<span>👍 {likes_fmt}</span><span>👁 {views_fmt} views</span>'
+        f'</div></div>'
+    )
 
 def export_queue_txt() -> bytes:
     lines = [f"https://youtu.be/{vid}  # {title}" for vid, title in st.session_state.queue]
