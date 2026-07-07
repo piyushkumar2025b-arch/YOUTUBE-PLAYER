@@ -1000,7 +1000,7 @@ with st.sidebar:
 
         st.download_button("Export library.json", data=export_library_json(),
                            file_name="tubeplay_library.json", mime="application/json",
-                           use_container_width=True)
+                           use_container_width=True, key="export_library_json_tab")
         library_upload_tab = st.file_uploader("Import library.json", type=["json"], key="library_upload_tab")
         if library_upload_tab and st.button("Import library file", use_container_width=True):
             ok, msg = import_library_json(library_upload_tab.getvalue())
@@ -1223,7 +1223,7 @@ with st.sidebar:
     with st.expander("💾 Library Backup"):
         st.download_button("Export library.json", data=export_library_json(),
                            file_name="tubeplay_library.json", mime="application/json",
-                           use_container_width=True)
+                           use_container_width=True, key="export_library_json_backup")
         library_upload = st.file_uploader("Import library.json", type=["json"], key="library_upload")
         if library_upload and st.button("Import Library", use_container_width=True):
             ok, msg = import_library_json(library_upload.getvalue())
