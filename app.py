@@ -6,8 +6,19 @@ import json
 import io
 import csv
 import base64
+import os
+import subprocess
+import sys
+from pathlib import Path
 import qrcode
 from PIL import Image
+
+# ── Feature modules (small, self-contained) ───────────────────────────────────
+from channel_info          import render_channel_panel
+from video_comments        import render_comments_panel
+from watch_stats           import record_watch_event, render_stats_dashboard
+from scheduler             import render_scheduler_panel, check_and_fire_scheduled
+from speedread_transcript  import render_speedread_panel
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,12 +52,20 @@ DEFAULTS = {
     "short_url_cache": {},  # vid_id -> short url
     # NEW
     "favorites": [],        # list of (vid_id, title)
+    "watch_later": [],      # list of (vid_id, title)
     "sleep_timer_mins": 0,  # 0 = off
     "sleep_timer_start": None,
     "watch_count": 0,       # total videos watched this session
     "search_order": "relevance",
     "search_type": "video",
     "search_safe": False,
+    "download_dir": "",
+    "last_download_path": "",
+    "saved_playlists": {},  # name -> list of (vid_id, title)
+    "related_results": [],
+    "trending_results": [],
+    "transcript_cache": {},  # vid_id -> transcript text
+    "timestamped_notes": {}, # vid_id -> list of {"time": "1:23", "note": "..."}
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -412,6 +431,98 @@ def search_youtube(query: str, api_key: str, max_results: int = 12,
     except Exception as e:
         return None, f"❌ Request failed: {e}"
 
+def get_playlist_id(url_or_id: str) -> str | None:
+    value = (url_or_id or "").strip()
+    if not value:
+        return None
+    if re.match(r"^[A-Za-z0-9_-]{16,}$", value) and "youtube" not in value:
+        return value
+    parsed = urllib.parse.urlparse(value)
+    query = urllib.parse.parse_qs(parsed.query)
+    return (query.get("list") or [None])[0]
+
+def import_youtube_playlist(playlist_id: str, api_key: str, limit: int = 50):
+    url = "https://www.googleapis.com/youtube/v3/playlistItems"
+    videos, page_token = [], None
+    try:
+        while len(videos) < limit:
+            params = {
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": min(50, limit - len(videos)),
+                "key": api_key,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200:
+                return None, f"Playlist API error {r.status_code}"
+            data = r.json()
+            for item in data.get("items", []):
+                snip = item.get("snippet", {})
+                resource = snip.get("resourceId", {})
+                vid = resource.get("videoId")
+                title = snip.get("title", vid or "Untitled")
+                if vid:
+                    videos.append((vid, title))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return videos, None
+    except Exception as exc:
+        return None, f"Playlist import failed: {exc}"
+
+def get_trending_videos(api_key: str, region: str = "US", category: str = "0", max_results: int = 12):
+    params = {
+        "part": "snippet,statistics",
+        "chart": "mostPopular",
+        "regionCode": region,
+        "maxResults": max_results,
+        "key": api_key,
+    }
+    if category != "0":
+        params["videoCategoryId"] = category
+    try:
+        r = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=10)
+        if r.status_code != 200:
+            return None, f"Trending API error {r.status_code}"
+        return r.json().get("items", []), None
+    except Exception as exc:
+        return None, f"Trending request failed: {exc}"
+
+def get_related_videos(video_id: str, api_key: str, max_results: int = 12):
+    info = get_video_info(video_id, api_key)
+    if not info:
+        return None, "Could not load the current video's details."
+    snip = info.get("snippet", {})
+    topic = " ".join([snip.get("title", ""), snip.get("channelTitle", "")]).strip()
+    return search_youtube(topic, api_key, max_results=max_results, order="relevance", video_type="video")
+
+def get_video_transcript(video_id: str) -> tuple[str | None, str | None]:
+    if video_id in st.session_state.transcript_cache:
+        return st.session_state.transcript_cache[video_id], None
+    url = f"https://video.google.com/timedtext?lang=en&v={video_id}"
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200 or not r.text.strip():
+            return None, "No English transcript was found for this video."
+        parts = re.findall(r'<text[^>]*start="([^"]+)"[^>]*>(.*?)</text>', r.text, flags=re.S)
+        lines = []
+        for start, raw in parts:
+            seconds = int(float(start))
+            stamp = f"{seconds // 60}:{seconds % 60:02d}"
+            text = re.sub(r"<[^>]+>", "", raw)
+            text = urllib.parse.unquote(text).replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", '"')
+            if text.strip():
+                lines.append(f"[{stamp}] {text.strip()}")
+        transcript = "\n".join(lines)
+        if not transcript:
+            return None, "Transcript data was empty."
+        st.session_state.transcript_cache[video_id] = transcript
+        return transcript, None
+    except Exception as exc:
+        return None, f"Transcript request failed: {exc}"
+
 def get_video_info(video_id: str, api_key: str):
     url = "https://www.googleapis.com/youtube/v3/videos"
     params = {"part": "snippet,statistics", "id": video_id, "key": api_key}
@@ -522,6 +633,58 @@ def get_short_url(video_id: str, yt_url: str) -> str:
         pass
     return yt_url
 
+def default_download_dir() -> str:
+    desktop = Path.home() / "Desktop"
+    base = desktop if desktop.exists() else Path.home() / "Downloads"
+    return str(base / "TubePlay Downloads")
+
+def download_video_locally(video_id: str, title: str, folder: str, quality: str) -> tuple[bool, str]:
+    target_dir = Path(folder).expanduser()
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return False, f"Could not create folder: {exc}"
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    output_template = str(target_dir / "%(title).180s [%(id)s].%(ext)s")
+    if quality == "Audio only":
+        format_selector = "bestaudio/best"
+        extra_args = ["--extract-audio", "--audio-format", "mp3"]
+    elif quality == "Small MP4":
+        format_selector = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]"
+        extra_args = []
+    else:
+        format_selector = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]"
+        extra_args = []
+
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "--restrict-filenames",
+        "-f", format_selector,
+        "-o", output_template,
+        "--print", "after_move:filepath",
+        *extra_args,
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except FileNotFoundError:
+        return False, "Python could not start the downloader."
+    except subprocess.TimeoutExpired:
+        return False, "Download took too long and was stopped."
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "Unknown downloader error").strip()
+        if "No module named yt_dlp" in error:
+            return False, "yt-dlp is not installed. Run: pip install -r requirements.txt"
+        return False, error[-700:]
+
+    saved_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    saved_path = saved_lines[-1] if saved_lines else str(target_dir)
+    st.session_state.last_download_path = saved_path
+    return True, saved_path
+
 def make_qr_b64(url: str) -> str:
     return base64.b64encode(make_qr_png(url)).decode()
 
@@ -572,11 +735,59 @@ def export_history_csv() -> bytes:
         w.writerow([vid, title, f"https://youtu.be/{vid}"])
     return buf.getvalue().encode("utf-8")
 
-def play_video(vid_id: str, title: str):
+def export_library_json() -> bytes:
+    data = {
+        "queue": st.session_state.queue,
+        "favorites": st.session_state.favorites,
+        "watch_later": st.session_state.watch_later,
+        "history": st.session_state.history,
+        "notes": st.session_state.video_notes,
+        "timestamped_notes": st.session_state.timestamped_notes,
+        "saved_playlists": st.session_state.saved_playlists,
+    }
+    return json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+
+def import_library_json(raw: bytes) -> tuple[bool, str]:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return False, f"Could not read JSON: {exc}"
+
+    def clean_pairs(value):
+        cleaned = []
+        for item in value or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                vid, title = str(item[0]), str(item[1])
+                if re.match(r"^[A-Za-z0-9_-]{11}$", vid):
+                    cleaned.append((vid, title))
+        return cleaned
+
+    for key in ["queue", "favorites", "watch_later", "history"]:
+        if key in data:
+            existing = [x[0] for x in st.session_state[key]]
+            st.session_state[key].extend([x for x in clean_pairs(data[key]) if x[0] not in existing])
+    if isinstance(data.get("notes"), dict):
+        st.session_state.video_notes.update({str(k): str(v) for k, v in data["notes"].items()})
+    if isinstance(data.get("timestamped_notes"), dict):
+        st.session_state.timestamped_notes.update(data["timestamped_notes"])
+    if isinstance(data.get("saved_playlists"), dict):
+        st.session_state.saved_playlists.update({
+            str(name): clean_pairs(items)
+            for name, items in data["saved_playlists"].items()
+        })
+    return True, "Library imported"
+
+def import_queue_text(raw: bytes):
+    text = raw.decode("utf-8", errors="ignore")
+    return parse_bulk_urls(text)
+
+def play_video(vid_id: str, title: str, channel: str = ""):
     st.session_state.playing_id = vid_id
     st.session_state.playing_title = title
     st.session_state.scroll_to_player = True
     st.session_state.watch_count += 1
+    # Record watch event for analytics
+    record_watch_event(vid_id, title, channel_name=channel)
     if vid_id not in [h[0] for h in st.session_state.history]:
         st.session_state.history.insert(0, (vid_id, title))
         st.session_state.history = st.session_state.history[:20]
@@ -587,6 +798,58 @@ def toggle_favorite(vid_id: str, title: str):
         st.session_state.favorites = [f for f in st.session_state.favorites if f[0] != vid_id]
     else:
         st.session_state.favorites.insert(0, (vid_id, title))
+
+def toggle_watch_later(vid_id: str, title: str):
+    ids = [w[0] for w in st.session_state.watch_later]
+    if vid_id in ids:
+        st.session_state.watch_later = [w for w in st.session_state.watch_later if w[0] != vid_id]
+    else:
+        st.session_state.watch_later.insert(0, (vid_id, title))
+
+def add_unique_to_queue(items):
+    existing_ids = [q[0] for q in st.session_state.queue]
+    new_items = [item for item in items if item[0] not in existing_ids]
+    st.session_state.queue.extend(new_items)
+    return len(new_items)
+
+def render_video_grid(items, key_prefix: str):
+    if not items:
+        return
+    cols = st.columns(4)
+    for i, item in enumerate(items):
+        if "snippet" in item:
+            vid_id = item.get("id", {}).get("videoId") if isinstance(item.get("id"), dict) else item.get("id")
+            snip = item.get("snippet", {})
+            thumb = snip.get("thumbnails", {}).get("medium", snip.get("thumbnails", {}).get("default", {})).get("url", "")
+            title = snip.get("title", "Untitled")
+            channel = snip.get("channelTitle", "")
+        else:
+            vid_id, title = item
+            thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+            channel = ""
+        if not vid_id:
+            continue
+        with cols[i % 4]:
+            st.markdown(f"""
+            <div class="video-card">
+              <img src="{thumb}" alt="{title}">
+              <div class="video-card-body">
+                <p class="video-card-title">{title}</p>
+                <span class="video-card-meta">{channel}</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+            short = title[:22] + "..." if len(title) > 22 else title
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                if st.button(f"Play {short}", key=f"{key_prefix}_play_{i}_{vid_id}", use_container_width=True):
+                    play_video(vid_id, title); st.rerun()
+            with c2:
+                if st.button("+", key=f"{key_prefix}_queue_{i}_{vid_id}", use_container_width=True):
+                    add_unique_to_queue([(vid_id, title)]); st.rerun()
+            with c3:
+                if st.button("*", key=f"{key_prefix}_fav_{i}_{vid_id}", use_container_width=True, help="Favorite"):
+                    toggle_favorite(vid_id, title); st.rerun()
 
 def export_notes_txt() -> bytes:
     lines = []
@@ -666,33 +929,103 @@ with st.sidebar:
     api_key = st.text_input("YouTube Data API v3 key", type="password", placeholder="AIza…", key="api_key_input")
     st.divider()
 
-    # ── Play by URL / ID ──
-    st.markdown("#### 🔗 Play by URL / ID")
-    direct_url = st.text_input("YouTube URL or Video ID", placeholder="https://youtu.be/… or dQw4w9WgXcQ", key="direct_url")
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        if st.button("▶ Play", use_container_width=True):
-            vid, start_t = extract_video_id(direct_url)
-            if vid:
-                title = oembed_title(vid) or vid
-                if api_key:
-                    info = get_video_info(vid, api_key)
-                    if info: title = info["snippet"]["title"]
-                play_video(vid, title)
-                st.session_state["start_t"] = start_t
+    quick_tab, playlists_tab, library_tab = st.tabs(["Quick", "Playlists", "Library"])
+
+    with playlists_tab:
+        st.markdown("#### Import YouTube Playlist")
+        playlist_url = st.text_input("Playlist URL or ID", key="playlist_url", placeholder="https://youtube.com/playlist?list=...")
+        playlist_limit = st.slider("Max videos", 5, 100, 50, 5, key="playlist_limit")
+        if st.button("Import playlist to queue", use_container_width=True):
+            if not api_key:
+                st.error("Add your YouTube API key first.")
+            else:
+                playlist_id = get_playlist_id(playlist_url)
+                if not playlist_id:
+                    st.error("Could not find a playlist ID.")
+                else:
+                    with st.spinner("Importing playlist..."):
+                        videos, err = import_youtube_playlist(playlist_id, api_key, playlist_limit)
+                    if err:
+                        st.error(err)
+                    else:
+                        count = add_unique_to_queue(videos)
+                        st.success(f"Added {count} video(s) to queue.")
+                        st.rerun()
+
+        st.markdown("#### Save / Load Queue")
+        save_name = st.text_input("Playlist name", key="save_playlist_name", placeholder="My study mix")
+        if st.button("Save current queue", use_container_width=True):
+            if save_name and st.session_state.queue:
+                st.session_state.saved_playlists[save_name] = list(st.session_state.queue)
+                st.success("Playlist saved.")
+            else:
+                st.warning("Add a name and at least one queued video.")
+        if st.session_state.saved_playlists:
+            selected_playlist = st.selectbox("Saved playlists", list(st.session_state.saved_playlists.keys()), key="saved_playlist_select")
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                if st.button("Load", use_container_width=True):
+                    add_unique_to_queue(st.session_state.saved_playlists[selected_playlist])
+                    st.rerun()
+            with pc2:
+                if st.button("Replace", use_container_width=True):
+                    st.session_state.queue = list(st.session_state.saved_playlists[selected_playlist])
+                    st.session_state.queue_index = 0
+                    st.rerun()
+
+    with library_tab:
+        st.markdown("#### Search Saved Videos")
+        lib_query = st.text_input("Search saved videos", key="library_search", placeholder="Queue, favorites, later, history")
+        all_saved = []
+        for source_name in ["queue", "favorites", "watch_later", "history"]:
+            for vid_id, title in st.session_state[source_name]:
+                all_saved.append((vid_id, title, source_name.replace("_", " ")))
+        if lib_query:
+            matches = [x for x in all_saved if lib_query.lower() in x[1].lower() or lib_query.lower() in x[0].lower()]
+            for vid_id, title, source in matches[:12]:
+                label = f"{title[:28]}{'...' if len(title) > 28 else ''} ({source})"
+                if st.button(label, key=f"lib_search_{source}_{vid_id}", use_container_width=True):
+                    play_video(vid_id, title); st.rerun()
+            if not matches:
+                st.caption("No saved videos matched.")
+
+        st.download_button("Export library.json", data=export_library_json(),
+                           file_name="tubeplay_library.json", mime="application/json",
+                           use_container_width=True)
+        library_upload_tab = st.file_uploader("Import library.json", type=["json"], key="library_upload_tab")
+        if library_upload_tab and st.button("Import library file", use_container_width=True):
+            ok, msg = import_library_json(library_upload_tab.getvalue())
+            st.success(msg) if ok else st.error(msg)
+            if ok:
                 st.rerun()
-            else:
-                st.error("Invalid URL/ID")
-    with col_b:
-        if st.button("+ Queue", use_container_width=True):
-            vid, _ = extract_video_id(direct_url)
-            if vid:
-                title = oembed_title(vid) or vid
-                if (vid, title) not in st.session_state.queue:
-                    st.session_state.queue.append((vid, title))
-                st.success("Added to queue")
-            else:
-                st.error("Invalid URL/ID")
+
+    # ── Play by URL / ID ──
+    with quick_tab:
+        st.markdown("#### Play by URL / ID")
+        direct_url = st.text_input("YouTube URL or Video ID", placeholder="https://youtu.be/... or dQw4w9WgXcQ", key="direct_url")
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            if st.button("Play", use_container_width=True):
+                vid, start_t = extract_video_id(direct_url)
+                if vid:
+                    title = oembed_title(vid) or vid
+                    if api_key:
+                        info = get_video_info(vid, api_key)
+                        if info: title = info["snippet"]["title"]
+                    play_video(vid, title)
+                    st.session_state["start_t"] = start_t
+                    st.rerun()
+                else:
+                    st.error("Invalid URL/ID")
+        with col_b:
+            if st.button("+ Queue", use_container_width=True):
+                vid, _ = extract_video_id(direct_url)
+                if vid:
+                    title = oembed_title(vid) or vid
+                    add_unique_to_queue([(vid, title)])
+                    st.success("Added to queue")
+                else:
+                    st.error("Invalid URL/ID")
 
     st.divider()
 
@@ -710,6 +1043,15 @@ with st.sidebar:
         else:
             st.error("No valid URLs found")
 
+    queue_upload = st.file_uploader("Import queue file", type=["txt", "csv"], key="queue_upload", label_visibility="collapsed")
+    if queue_upload and st.button("Import Queue File", use_container_width=True):
+        added = import_queue_text(queue_upload.getvalue())
+        existing_ids = [q[0] for q in st.session_state.queue]
+        new = [x for x in added if x[0] not in existing_ids]
+        st.session_state.queue.extend(new)
+        st.success(f"Imported {len(new)} video(s)")
+        st.rerun()
+
     st.divider()
 
     # ── Queue ──
@@ -724,10 +1066,30 @@ with st.sidebar:
         for i, (qid, qtitle) in enumerate(st.session_state.queue):
             is_active = qid == st.session_state.playing_id
             label = f"{'▶ ' if is_active else f'{i+1}. '}{qtitle[:26]}{'…' if len(qtitle)>26 else ''}"
-            if st.button(label, key=f"q_{i}_{qid}", use_container_width=True):
-                play_video(qid, qtitle)
-                st.session_state.queue_index = i
-                st.rerun()
+            qi_play, qi_up, qi_down, qi_later, qi_remove = st.columns([5, 1, 1, 1, 1])
+            with qi_play:
+                if st.button(label, key=f"q_{i}_{qid}", use_container_width=True):
+                    play_video(qid, qtitle)
+                    st.session_state.queue_index = i
+                    st.rerun()
+            with qi_up:
+                if st.button("↑", key=f"up_q_{i}_{qid}", use_container_width=True, disabled=i == 0, help="Move up"):
+                    st.session_state.queue[i - 1], st.session_state.queue[i] = st.session_state.queue[i], st.session_state.queue[i - 1]
+                    st.session_state.queue_index = max(st.session_state.queue_index - 1, 0)
+                    st.rerun()
+            with qi_down:
+                if st.button("↓", key=f"down_q_{i}_{qid}", use_container_width=True, disabled=i == len(st.session_state.queue) - 1, help="Move down"):
+                    st.session_state.queue[i + 1], st.session_state.queue[i] = st.session_state.queue[i], st.session_state.queue[i + 1]
+                    st.session_state.queue_index = min(st.session_state.queue_index + 1, len(st.session_state.queue) - 1)
+                    st.rerun()
+            with qi_later:
+                if st.button("⏳", key=f"later_q_{i}_{qid}", use_container_width=True, help="Save for later"):
+                    toggle_watch_later(qid, qtitle); st.rerun()
+            with qi_remove:
+                if st.button("×", key=f"rm_q_{i}_{qid}", use_container_width=True, help="Remove from queue"):
+                    st.session_state.queue.pop(i)
+                    st.session_state.queue_index = min(st.session_state.queue_index, max(len(st.session_state.queue) - 1, 0))
+                    st.rerun()
 
         c_prev, c_next, c_shuf, c_clr = st.columns(4)
         with c_prev:
@@ -753,6 +1115,21 @@ with st.sidebar:
             if st.button("🗑", use_container_width=True):
                 st.session_state.queue = []; st.session_state.queue_index = 0; st.rerun()
 
+        st.divider()
+
+    # ── Watch Later ──
+    if st.session_state.watch_later:
+        st.markdown("#### ⏳ Watch Later")
+        for later_id, later_title in st.session_state.watch_later[:8]:
+            wl1, wl2 = st.columns([4, 1])
+            with wl1:
+                wl_label = later_title[:24] + "…" if len(later_title) > 24 else later_title
+                if st.button(f"▶ {wl_label}", key=f"later_play_{later_id}", use_container_width=True):
+                    play_video(later_id, later_title); st.rerun()
+            with wl2:
+                if st.button("×", key=f"later_rm_{later_id}", use_container_width=True):
+                    st.session_state.watch_later = [w for w in st.session_state.watch_later if w[0] != later_id]
+                    st.rerun()
         st.divider()
 
     # ── Pinned Video ──
@@ -820,10 +1197,30 @@ with st.sidebar:
             lbl = ("▶ " if vid_id == st.session_state.playing_id else "") + (title[:26] + "…" if len(title) > 26 else title)
             if st.button(lbl, key=f"hist_{vid_id}", use_container_width=True):
                 play_video(vid_id, title); st.rerun()
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            if st.button("Resume last", use_container_width=True):
+                vid_id, title = st.session_state.history[0]
+                play_video(vid_id, title); st.rerun()
+        with hc2:
+            if st.button("Clear history", use_container_width=True):
+                st.session_state.history = []; st.rerun()
         st.download_button("⬇ Export history.csv", data=export_history_csv(),
                            file_name="tubeplay_history.csv", mime="text/csv",
                            use_container_width=True)
         st.divider()
+
+    # ── Library backup ──
+    with st.expander("💾 Library Backup"):
+        st.download_button("Export library.json", data=export_library_json(),
+                           file_name="tubeplay_library.json", mime="application/json",
+                           use_container_width=True)
+        library_upload = st.file_uploader("Import library.json", type=["json"], key="library_upload")
+        if library_upload and st.button("Import Library", use_container_width=True):
+            ok, msg = import_library_json(library_upload.getvalue())
+            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.rerun()
 
     # ── Keyboard hints ──
     st.markdown(f"""
@@ -838,19 +1235,28 @@ with st.sidebar:
 
 
 # ─── Main Content ─────────────────────────────────────────────────────────────
+# Fire any due scheduled events before rendering the player
+check_and_fire_scheduled()
+
 st.markdown("## ▶️ TubePlay")
 
 # ── Session Stats Bar ──
-if st.session_state.watch_count > 0 or st.session_state.queue or st.session_state.favorites:
+if st.session_state.watch_count > 0 or st.session_state.queue or st.session_state.favorites or st.session_state.watch_later:
     fav_count = len(st.session_state.favorites)
     q_count = len(st.session_state.queue)
     h_count = len(st.session_state.history)
+    later_count = len(st.session_state.watch_later)
+    playlist_count = len(st.session_state.saved_playlists)
+    note_count = len(st.session_state.video_notes) + sum(len(v) for v in st.session_state.timestamped_notes.values())
     st.markdown(f"""
     <div class="stats-bar">
       <div class="stat-item">🎬 Watched: <span>{st.session_state.watch_count}</span></div>
       <div class="stat-item">🎵 Queue: <span>{q_count}</span></div>
       <div class="stat-item">⭐ Favorites: <span>{fav_count}</span></div>
+      <div class="stat-item">⏳ Later: <span>{later_count}</span></div>
       <div class="stat-item">🕒 History: <span>{h_count}</span></div>
+      <div class="stat-item">📚 Playlists: <span>{playlist_count}</span></div>
+      <div class="stat-item">📝 Notes: <span>{note_count}</span></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -869,12 +1275,12 @@ if not st.session_state.playing_id and not st.session_state.search_results:
     # Feature highlights
     fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
     features = [
-        ("🎵", "Queue", "Build a playlist from any URLs"),
-        ("🎬", "Theater", "Distraction-free full-width mode"),
-        ("📺", "Mini Player", "Float the player while you browse"),
-        ("🔀", "Shuffle", "Randomize your queue anytime"),
-        ("⭐", "Favorites", "Star videos to revisit anytime"),
-        ("😴", "Sleep Timer", "Auto-stop playback after a set time"),
+        ("🎵", "Queue", "Build and reorder a playlist from any URLs"),
+        ("📚", "Playlists", "Import YouTube playlists or save your own"),
+        ("🔥", "Discover", "Browse trending and related videos"),
+        ("📝", "Notes", "Keep normal and timestamped notes"),
+        ("📄", "Transcripts", "Load, search, and export captions"),
+        ("⭐", "Library", "Search favorites, later, queue, and history"),
     ]
     for col, (icon, title, desc) in zip([fc1, fc2, fc3, fc4, fc5, fc6], features):
         with col:
@@ -948,7 +1354,7 @@ if st.session_state.playing_id:
                                    loop=st.session_state.loop_mode), unsafe_allow_html=True)
 
             # Fullscreen + PiP buttons below player
-            btn_fs, btn_pip, btn_pin, btn_fav, _ = st.columns([1, 1, 1, 1, 2])
+            btn_fs, btn_pip, btn_pin, btn_fav, btn_later, _ = st.columns([1, 1, 1, 1, 1, 1])
             with btn_fs:
                 st.markdown(f"""<button onclick="var w=document.querySelector('.player-wrap,.player-wrap-theater');if(w&&w.requestFullscreen)w.requestFullscreen();"
                   style="background:{ACCENT};color:#fff;border:none;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:{FS_SMALL};font-weight:600">⛶ Fullscreen</button>""",
@@ -970,6 +1376,11 @@ if st.session_state.playing_id:
                 fav_btn_lbl = "⭐ Unfav" if is_fav_now else "☆ Fav"
                 if st.button(fav_btn_lbl, key="fav_player_btn"):
                     toggle_favorite(vid, st.session_state.playing_title); st.rerun()
+            with btn_later:
+                is_later_now = vid in [w[0] for w in st.session_state.watch_later]
+                later_btn_lbl = "✓ Later" if is_later_now else "⏳ Later"
+                if st.button(later_btn_lbl, key="later_player_btn"):
+                    toggle_watch_later(vid, st.session_state.playing_title); st.rerun()
 
         with col_info:
             st.markdown(f"**{st.session_state.playing_title}**")
@@ -996,6 +1407,61 @@ if st.session_state.playing_id:
             st.session_state.video_notes[vid] = note
         if existing_note:
             st.markdown(f'<div class="notes-box">{existing_note}</div>', unsafe_allow_html=True)
+        st.markdown("##### Timestamped notes")
+        tc1, tc2 = st.columns([1, 3])
+        with tc1:
+            note_time = st.text_input("Time", placeholder="1:23", key=f"ts_time_{vid}", label_visibility="collapsed")
+        with tc2:
+            note_text = st.text_input("Note", placeholder="Important moment...", key=f"ts_note_{vid}", label_visibility="collapsed")
+        if st.button("Add timestamped note", key=f"add_ts_note_{vid}"):
+            if note_time and note_text:
+                st.session_state.timestamped_notes.setdefault(vid, []).append({"time": note_time, "note": note_text})
+                st.rerun()
+        for idx, item in enumerate(st.session_state.timestamped_notes.get(vid, [])):
+            n1, n2 = st.columns([5, 1])
+            with n1:
+                st.markdown(f"`{item.get('time', '')}` {item.get('note', '')}")
+            with n2:
+                if st.button("×", key=f"rm_ts_{vid}_{idx}"):
+                    st.session_state.timestamped_notes[vid].pop(idx)
+                    st.rerun()
+
+    with st.expander("📄 Transcript"):
+        if st.button("Load transcript", key=f"load_transcript_{vid}"):
+            with st.spinner("Checking captions..."):
+                transcript, err = get_video_transcript(vid)
+            if err:
+                st.warning(err)
+            else:
+                st.session_state.transcript_cache[vid] = transcript
+        transcript = st.session_state.transcript_cache.get(vid)
+        if transcript:
+            transcript_query = st.text_input("Search transcript", key=f"transcript_search_{vid}", placeholder="Find a phrase")
+            shown_transcript = transcript
+            if transcript_query:
+                shown_transcript = "\n".join([line for line in transcript.splitlines() if transcript_query.lower() in line.lower()])
+            st.text_area("Transcript text", value=shown_transcript, height=220, key=f"transcript_text_{vid}", label_visibility="collapsed")
+            st.download_button("Export transcript.txt", data=transcript.encode("utf-8"),
+                               file_name=f"tubeplay-{vid}-transcript.txt", mime="text/plain",
+                               use_container_width=True)
+
+    # ── Local Download ──
+    with st.expander("⬇ Download locally"):
+        st.caption("Saves videos you own or have permission to download. On Streamlit Cloud this saves on the server; run locally to save on this laptop.")
+        if not st.session_state.download_dir:
+            st.session_state.download_dir = default_download_dir()
+        dl_dir = st.text_input("Download location", value=st.session_state.download_dir, key="download_dir_input")
+        st.session_state.download_dir = dl_dir
+        dl_quality = st.selectbox("Format", ["MP4 up to 720p", "Small MP4", "Audio only"], key="download_quality")
+        if st.button("Download this video", key="download_video_btn", use_container_width=True):
+            with st.spinner("Downloading to your selected folder..."):
+                ok, message = download_video_locally(vid, st.session_state.playing_title, dl_dir, dl_quality)
+            if ok:
+                st.success("Saved to: " + message)
+            else:
+                st.error(message)
+        if st.session_state.last_download_path:
+            st.info("Last saved file: " + st.session_state.last_download_path)
 
     # ── Share & Embed ──
     if _render_share:
@@ -1048,72 +1514,62 @@ if st.session_state.playing_id:
 
     st.divider()
 
+    # ── Comments ──
+    with st.expander("💬 Comments"):
+        render_comments_panel(vid, api_key)
+
+    # ── Speed-Read Transcript ──
+    with st.expander("⚡ Speed-Read Transcript"):
+        render_speedread_panel(vid, st.session_state.transcript_cache.get(vid))
+
+# ─── Discover ─────────────────────────────────────────────────────────────────
+with st.expander("🔥 Discover"):
+    if not api_key:
+        st.caption("Add your YouTube API key in the sidebar to use trending and related videos.")
+    else:
+        d1, d2, d3 = st.columns([1, 1, 1])
+        with d1:
+            region = st.selectbox("Region", ["US", "IN", "GB", "CA", "AU", "DE", "FR", "JP", "BR"], key="trend_region")
+        with d2:
+            category = st.selectbox(
+                "Category",
+                [("0", "All"), ("10", "Music"), ("20", "Gaming"), ("24", "Entertainment"), ("25", "News"), ("26", "How-to"), ("28", "Tech")],
+                format_func=lambda item: item[1],
+                key="trend_category",
+            )
+        with d3:
+            st.write("")
+            load_trending = st.button("Load trending", use_container_width=True)
+        if load_trending:
+            with st.spinner("Loading trending videos..."):
+                results, err = get_trending_videos(api_key, region=region, category=category[0])
+            if err:
+                st.error(err)
+            else:
+                st.session_state.trending_results = results
+        if st.session_state.trending_results:
+            st.markdown("##### Trending")
+            render_video_grid(st.session_state.trending_results, "trending")
+
+        if st.session_state.playing_id:
+            if st.button("Find related to current video", use_container_width=True):
+                with st.spinner("Finding related videos..."):
+                    results, err = get_related_videos(st.session_state.playing_id, api_key)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.related_results = [
+                        item for item in results
+                        if item.get("id", {}).get("videoId") != st.session_state.playing_id
+                    ]
+            if st.session_state.related_results:
+                st.markdown("##### Related")
+                render_video_grid(st.session_state.related_results, "related")
+
 # ─── Search ──────────────────────────────────────────────────────────────────
 st.markdown("#### 🔍 Search YouTube")
-if not api_key:
-    st.warning("Add your free YouTube Data API v3 key in the sidebar to enable search.")
-else:
-    search_col, btn_col = st.columns([5, 1])
-    with search_col:
-        query = st.text_input("Search query", placeholder="lo-fi hip hop, coding tutorials…",
-                              label_visibility="collapsed", key="search_query")
-    with btn_col:
-        do_search = st.button("Search", use_container_width=True)
-
-    # Search filter row
-    sf1, sf2, sf3 = st.columns(3)
-    with sf1:
-        s_order = st.selectbox("Sort by", ["relevance", "date", "viewCount", "rating", "title"],
-                               index=["relevance","date","viewCount","rating","title"].index(st.session_state.search_order),
-                               key="s_order", label_visibility="collapsed")
-        if s_order != st.session_state.search_order:
-            st.session_state.search_order = s_order
-    with sf2:
-        s_type = st.selectbox("Type", ["video", "channel", "playlist"],
-                              index=["video","channel","playlist"].index(st.session_state.search_type),
-                              key="s_type", label_visibility="collapsed")
-        if s_type != st.session_state.search_type:
-            st.session_state.search_type = s_type
-    with sf3:
-        s_safe = st.checkbox("Safe search", value=st.session_state.search_safe, key="s_safe")
-        if s_safe != st.session_state.search_safe:
-            st.session_state.search_safe = s_safe
-
-    if do_search and query:
-        with st.spinner("Searching…"):
-            results, err = search_youtube(query, api_key,
-                                          order=st.session_state.search_order,
-                                          video_type=st.session_state.search_type,
-                                          safe=st.session_state.search_safe)
-        if err:
-            st.error(err)
-        elif results:
-            st.session_state.search_results = results
-        else:
             st.info("No results found.")
 
-    if st.session_state.search_results:
-        st.markdown(f"<p style='color:{MUTED};font-size:{FS_SMALL}'>Showing {len(st.session_state.search_results)} results — click ▶ to play or + to queue</p>", unsafe_allow_html=True)
-        cols = st.columns(4)
-        for i, item in enumerate(st.session_state.search_results):
-            vid_id  = item["id"]["videoId"]
-            snip    = item["snippet"]
-            thumb   = snip["thumbnails"].get("medium", snip["thumbnails"].get("default", {})).get("url", "")
-            title   = snip.get("title", "Untitled")
-            channel = snip.get("channelTitle", "")
-
-            with cols[i % 4]:
-                if thumb:
-                    st.markdown(f"""
-                    <div class="video-card">
-                      <img src="{thumb}" alt="{title}">
-                      <div class="video-card-body">
-                        <p class="video-card-title">{title}</p>
-                        <span class="video-card-meta">{channel}</span>
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                short = title[:22] + "…" if len(title) > 22 else title
                 pb1, pb2, pb3 = st.columns([3, 1, 1])
                 with pb1:
                     if st.button(f"▶ {short}", key=f"play_{vid_id}", use_container_width=True):
@@ -1127,6 +1583,8 @@ else:
                     fav_lbl = "⭐" if is_fav else "☆"
                     if st.button(fav_lbl, key=f"fav_{vid_id}", use_container_width=True, help="Favorite"):
                         toggle_favorite(vid_id, title); st.rerun()
+                if st.button("⏳ Watch later", key=f"later_{vid_id}", use_container_width=True):
+                    toggle_watch_later(vid_id, title); st.rerun()
 
 # ─── Info expander ───────────────────────────────────────────────────────────
 with st.expander("ℹ️ How to get a free YouTube Data API v3 key"):
