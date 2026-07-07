@@ -69,6 +69,7 @@ DEFAULTS = {
     "trending_results": [],
     "transcript_cache": {},  # vid_id -> transcript text
     "timestamped_notes": {}, # vid_id -> list of {"time": "1:23", "note": "..."}
+    "video_clips": {},       # video_id -> list of {"title": str, "start": int, "end": int}
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -779,8 +780,8 @@ def import_library_json(raw: bytes) -> tuple[bool, str]:
             str(name): clean_pairs(items)
             for name, items in data["saved_playlists"].items()
         })
-        if isinstance(data.get("video_clips"), dict):
-            st.session_state.video_clips.update(data["video_clips"])
+    if isinstance(data.get("video_clips"), dict):
+        st.session_state.video_clips.update(data["video_clips"])
     return True, "Library imported"
 
 def import_queue_text(raw: bytes):
