@@ -80,64 +80,49 @@ def render_focus_panel(api_key: str | None = None):
     st.markdown("#### ⏳ Pomodoro Focus Center")
     st.caption("Maximize study productivity by scheduling focus sessions and breaks.")
 
-    # ── Grid Layout: Timer and Controls ──
-    timer_col, stats_col = st.columns([2, 1])
+    # ── Timer display ──
+    mins = st.session_state.focus_time_left // 60
+    secs = st.session_state.focus_time_left % 60
+    timer_str = f"{mins:02d}:{secs:02d}"
+    bg_col = "#e84545" if st.session_state.focus_mode == "Work" else "#393e46"
+    st.markdown(
+        f"""
+        <div style="background:{bg_col}22; border: 1px solid {bg_col}55; border-radius:12px; padding:20px; text-align:center; margin-bottom:12px">
+          <span style="font-size:13px; font-family: JetBrains Mono; text-transform:uppercase; color:{bg_col}">{st.session_state.focus_mode} Mode</span>
+          <h2 style="font-size:3em; font-family: JetBrains Mono; font-weight:700; margin:4px 0 0 0; color:#fff">{timer_str}</h2>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    with timer_col:
-        # Style and render Pomodoro countdown timer
-        mins = st.session_state.focus_time_left // 60
-        secs = st.session_state.focus_time_left % 60
-        timer_str = f"{mins:02d}:{secs:02d}"
-        
-        # Accent background matching timer mode
-        bg_col = "#e84545" if st.session_state.focus_mode == "Work" else "#393e46"
-        st.markdown(
-            f"""
-            <div style="background:{bg_col}22; border: 1px solid {bg_col}55; border-radius:12px; padding:20px; text-align:center; margin-bottom:12px">
-              <span style="font-size:13px; font-family: JetBrains Mono; text-transform:uppercase; color:{bg_col}">{st.session_state.focus_mode} Mode</span>
-              <h2 style="font-size:3em; font-family: JetBrains Mono; font-weight:700; margin:4px 0 0 0; color:#fff">{timer_str}</h2>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        # Controls row
-        btn1, btn2, btn3 = st.columns(3)
-        with btn1:
-            if st.session_state.focus_state == "running":
-                if st.button("Pause", key="focus_pause_btn", use_container_width=True):
-                    st.session_state.focus_state = "paused"
-                    st.rerun()
-            else:
-                label = "Resume" if st.session_state.focus_state == "paused" else "Start"
-                if st.button(label, key="focus_start_btn", use_container_width=True):
-                    st.session_state.focus_state = "running"
-                    st.session_state.focus_last_tick = time.time()
-                    st.rerun()
-        with btn2:
-            if st.button("Reset", key="focus_reset_btn", use_container_width=True):
-                st.session_state.focus_state = "idle"
-                st.session_state.focus_time_left = get_mode_duration(st.session_state.focus_mode)
-                st.rerun()
-        with btn3:
-            # Mode picker
-            next_mode = "Short Break" if st.session_state.focus_mode == "Work" else "Work"
-            if st.button(f"Skip to {next_mode}", key="focus_skip_btn", use_container_width=True):
-                st.session_state.focus_state = "idle"
-                st.session_state.focus_mode = next_mode
-                st.session_state.focus_time_left = get_mode_duration(next_mode)
-                st.rerun()
-
-    with stats_col:
-        st.markdown("<p style='font-size:14px; font-weight:600;'>Session Goals</p>", unsafe_allow_html=True)
-        st.markdown(f"🏆 Completed Work Blocks: **{st.session_state.focus_completed}**")
-        st.markdown(f"⏱️ Total Study Time: **{st.session_state.focus_completed * 25} mins**")
-        
-        # Configuration checkboxes
-        auto_p = st.checkbox("Auto-Pause Player", value=st.session_state.focus_auto_pause, key="auto_pause_cb", help="Automatically pause YouTube player when Work session ends and break starts.")
-        if auto_p != st.session_state.focus_auto_pause:
-            st.session_state.focus_auto_pause = auto_p
+    # ── Controls (flat — no nested columns) ──
+    if st.session_state.focus_state == "running":
+        if st.button("⏸ Pause", key="focus_pause_btn", use_container_width=True):
+            st.session_state.focus_state = "paused"
             st.rerun()
+    else:
+        label = "▶ Resume" if st.session_state.focus_state == "paused" else "▶ Start"
+        if st.button(label, key="focus_start_btn", use_container_width=True):
+            st.session_state.focus_state = "running"
+            st.session_state.focus_last_tick = time.time()
+            st.rerun()
+    if st.button("↺ Reset", key="focus_reset_btn", use_container_width=True):
+        st.session_state.focus_state = "idle"
+        st.session_state.focus_time_left = get_mode_duration(st.session_state.focus_mode)
+        st.rerun()
+    next_mode = "Short Break" if st.session_state.focus_mode == "Work" else "Work"
+    if st.button(f"⏭ Skip to {next_mode}", key="focus_skip_btn", use_container_width=True):
+        st.session_state.focus_state = "idle"
+        st.session_state.focus_mode = next_mode
+        st.session_state.focus_time_left = get_mode_duration(next_mode)
+        st.rerun()
+
+    # ── Stats ──
+    st.caption(f"🏆 Completed: {st.session_state.focus_completed} block(s) · ⏱️ {st.session_state.focus_completed * 25} mins")
+    auto_p = st.checkbox("Auto-Pause Player on Break", value=st.session_state.focus_auto_pause, key="auto_pause_cb")
+    if auto_p != st.session_state.focus_auto_pause:
+        st.session_state.focus_auto_pause = auto_p
+        st.rerun()
 
     st.divider()
 

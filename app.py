@@ -915,19 +915,15 @@ with st.sidebar:
         if vol != st.session_state.volume:
             st.session_state.volume = vol; st.rerun()
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            loop = st.checkbox("🔁 Loop", value=st.session_state.loop_mode, key="loop_cb")
-            if loop != st.session_state.loop_mode:
-                st.session_state.loop_mode = loop
-        with c2:
-            shuffle = st.checkbox("🔀 Shuffle", value=st.session_state.shuffle_mode, key="shuf_cb")
-            if shuffle != st.session_state.shuffle_mode:
-                st.session_state.shuffle_mode = shuffle
-        with c3:
-            auto_n = st.checkbox("⏭ Auto", value=st.session_state.autoplay_next, key="auto_cb")
-            if auto_n != st.session_state.autoplay_next:
-                st.session_state.autoplay_next = auto_n
+        loop = st.checkbox("🔁 Loop", value=st.session_state.loop_mode, key="loop_cb")
+        if loop != st.session_state.loop_mode:
+            st.session_state.loop_mode = loop
+        shuffle = st.checkbox("🔀 Shuffle", value=st.session_state.shuffle_mode, key="shuf_cb")
+        if shuffle != st.session_state.shuffle_mode:
+            st.session_state.shuffle_mode = shuffle
+        auto_n = st.checkbox("⏭ Auto-next", value=st.session_state.autoplay_next, key="auto_cb")
+        if auto_n != st.session_state.autoplay_next:
+            st.session_state.autoplay_next = auto_n
 
     st.divider()
 
@@ -972,16 +968,13 @@ with st.sidebar:
                 st.warning("Add a name and at least one queued video.")
         if st.session_state.saved_playlists:
             selected_playlist = st.selectbox("Saved playlists", list(st.session_state.saved_playlists.keys()), key="saved_playlist_select")
-            pc1, pc2 = st.columns(2)
-            with pc1:
-                if st.button("Load", use_container_width=True):
-                    add_unique_to_queue(st.session_state.saved_playlists[selected_playlist])
-                    st.rerun()
-            with pc2:
-                if st.button("Replace", use_container_width=True):
-                    st.session_state.queue = list(st.session_state.saved_playlists[selected_playlist])
-                    st.session_state.queue_index = 0
-                    st.rerun()
+            if st.button("Load playlist", use_container_width=True):
+                add_unique_to_queue(st.session_state.saved_playlists[selected_playlist])
+                st.rerun()
+            if st.button("Replace queue", use_container_width=True):
+                st.session_state.queue = list(st.session_state.saved_playlists[selected_playlist])
+                st.session_state.queue_index = 0
+                st.rerun()
 
     with library_tab:
         st.markdown("#### Search Saved Videos")
@@ -1076,39 +1069,38 @@ with st.sidebar:
         for i, (qid, qtitle) in enumerate(st.session_state.queue):
             is_active = qid == st.session_state.playing_id
             label = f"{'▶ ' if is_active else f'{i+1}. '}{qtitle[:26]}{'…' if len(qtitle)>26 else ''}"
-            qi_play, qi_up, qi_down, qi_later, qi_remove = st.columns([5, 1, 1, 1, 1])
-            with qi_play:
-                if st.button(label, key=f"q_{i}_{qid}", use_container_width=True):
-                    play_video(qid, qtitle)
-                    st.session_state.queue_index = i
-                    st.rerun()
-            with qi_up:
-                if st.button("↑", key=f"up_q_{i}_{qid}", use_container_width=True, disabled=i == 0, help="Move up"):
+            if st.button(label, key=f"q_{i}_{qid}", use_container_width=True):
+                play_video(qid, qtitle)
+                st.session_state.queue_index = i
+                st.rerun()
+            col_up, col_down, col_later, col_rm = st.columns(4)
+            with col_up:
+                if st.button("↑", key=f"up_q_{i}_{qid}", use_container_width=True, disabled=i == 0):
                     st.session_state.queue[i - 1], st.session_state.queue[i] = st.session_state.queue[i], st.session_state.queue[i - 1]
                     st.session_state.queue_index = max(st.session_state.queue_index - 1, 0)
                     st.rerun()
-            with qi_down:
-                if st.button("↓", key=f"down_q_{i}_{qid}", use_container_width=True, disabled=i == len(st.session_state.queue) - 1, help="Move down"):
+            with col_down:
+                if st.button("↓", key=f"down_q_{i}_{qid}", use_container_width=True, disabled=i == len(st.session_state.queue) - 1):
                     st.session_state.queue[i + 1], st.session_state.queue[i] = st.session_state.queue[i], st.session_state.queue[i + 1]
                     st.session_state.queue_index = min(st.session_state.queue_index + 1, len(st.session_state.queue) - 1)
                     st.rerun()
-            with qi_later:
+            with col_later:
                 if st.button("⏳", key=f"later_q_{i}_{qid}", use_container_width=True, help="Save for later"):
                     toggle_watch_later(qid, qtitle); st.rerun()
-            with qi_remove:
-                if st.button("×", key=f"rm_q_{i}_{qid}", use_container_width=True, help="Remove from queue"):
+            with col_rm:
+                if st.button("×", key=f"rm_q_{i}_{qid}", use_container_width=True, help="Remove"):
                     st.session_state.queue.pop(i)
                     st.session_state.queue_index = min(st.session_state.queue_index, max(len(st.session_state.queue) - 1, 0))
                     st.rerun()
 
-        c_prev, c_next, c_shuf, c_clr = st.columns(4)
-        with c_prev:
-            if st.button("⏮", use_container_width=True):
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        with qc1:
+            if st.button("⏮ Prev", use_container_width=True):
                 idx = max(st.session_state.queue_index - 1, 0)
                 qid, qtitle = st.session_state.queue[idx]
                 play_video(qid, qtitle); st.session_state.queue_index = idx; st.rerun()
-        with c_next:
-            if st.button("⏭", use_container_width=True):
+        with qc2:
+            if st.button("⏭ Next", use_container_width=True):
                 if st.session_state.shuffle_mode:
                     import random
                     idx = random.randint(0, len(st.session_state.queue)-1)
@@ -1116,13 +1108,13 @@ with st.sidebar:
                     idx = min(st.session_state.queue_index + 1, len(st.session_state.queue)-1)
                 qid, qtitle = st.session_state.queue[idx]
                 play_video(qid, qtitle); st.session_state.queue_index = idx; st.rerun()
-        with c_shuf:
-            if st.button("🔀", use_container_width=True, help="Shuffle now"):
+        with qc3:
+            if st.button("🔀 Shuf", use_container_width=True):
                 import random
                 random.shuffle(st.session_state.queue)
                 st.rerun()
-        with c_clr:
-            if st.button("🗑", use_container_width=True):
+        with qc4:
+            if st.button("🗑 Clear", use_container_width=True):
                 st.session_state.queue = []; st.session_state.queue_index = 0; st.rerun()
 
         st.divider()
@@ -1131,15 +1123,12 @@ with st.sidebar:
     if st.session_state.watch_later:
         st.markdown("#### ⏳ Watch Later")
         for later_id, later_title in st.session_state.watch_later[:8]:
-            wl1, wl2 = st.columns([4, 1])
-            with wl1:
-                wl_label = later_title[:24] + "…" if len(later_title) > 24 else later_title
-                if st.button(f"▶ {wl_label}", key=f"later_play_{later_id}", use_container_width=True):
-                    play_video(later_id, later_title); st.rerun()
-            with wl2:
-                if st.button("×", key=f"later_rm_{later_id}", use_container_width=True):
-                    st.session_state.watch_later = [w for w in st.session_state.watch_later if w[0] != later_id]
-                    st.rerun()
+            wl_label = later_title[:28] + "…" if len(later_title) > 28 else later_title
+            if st.button(f"▶ {wl_label}", key=f"later_play_{later_id}", use_container_width=True):
+                play_video(later_id, later_title); st.rerun()
+            if st.button(f"× Remove '{later_title[:18]}…'", key=f"later_rm_{later_id}", use_container_width=True):
+                st.session_state.watch_later = [w for w in st.session_state.watch_later if w[0] != later_id]
+                st.rerun()
         st.divider()
 
     # ── Pinned Video ──
@@ -1147,27 +1136,21 @@ with st.sidebar:
         pvid, ptitle = st.session_state.pinned_video
         short_p = ptitle[:24] + "…" if len(ptitle) > 24 else ptitle
         st.markdown(f"#### 📌 Pinned")
-        pc1, pc2 = st.columns([3, 1])
-        with pc1:
-            if st.button(f"▶ {short_p}", key="play_pinned", use_container_width=True):
-                play_video(pvid, ptitle); st.rerun()
-        with pc2:
-            if st.button("✕", key="unpin", use_container_width=True):
-                st.session_state.pinned_video = None; st.rerun()
+        if st.button(f"▶ {short_p}", key="play_pinned", use_container_width=True):
+            play_video(pvid, ptitle); st.rerun()
+        if st.button("✕ Unpin", key="unpin", use_container_width=True):
+            st.session_state.pinned_video = None; st.rerun()
         st.divider()
 
     # ── Favorites ──
     if st.session_state.favorites:
         st.markdown("#### ⭐ Favorites")
         for fav_id, fav_title in st.session_state.favorites[:8]:
-            fl1, fl2 = st.columns([4, 1])
-            with fl1:
-                flbl = ("▶ " if fav_id == st.session_state.playing_id else "") + (fav_title[:22] + "…" if len(fav_title) > 22 else fav_title)
-                if st.button(flbl, key=f"fav_play_{fav_id}", use_container_width=True):
-                    play_video(fav_id, fav_title); st.rerun()
-            with fl2:
-                if st.button("✕", key=f"fav_rm_{fav_id}", use_container_width=True):
-                    st.session_state.favorites = [f for f in st.session_state.favorites if f[0] != fav_id]; st.rerun()
+            flbl = ("▶ " if fav_id == st.session_state.playing_id else "") + (fav_title[:26] + "…" if len(fav_title) > 26 else fav_title)
+            if st.button(flbl, key=f"fav_play_{fav_id}", use_container_width=True):
+                play_video(fav_id, fav_title); st.rerun()
+            if st.button(f"✕ Remove", key=f"fav_rm_{fav_id}", use_container_width=True):
+                st.session_state.favorites = [f for f in st.session_state.favorites if f[0] != fav_id]; st.rerun()
         if st.session_state.video_notes:
             st.download_button("⬇ Export notes.txt", data=export_notes_txt(),
                                file_name="tubeplay_notes.txt", mime="text/plain",
@@ -1207,14 +1190,11 @@ with st.sidebar:
             lbl = ("▶ " if vid_id == st.session_state.playing_id else "") + (title[:26] + "…" if len(title) > 26 else title)
             if st.button(lbl, key=f"hist_{vid_id}", use_container_width=True):
                 play_video(vid_id, title); st.rerun()
-        hc1, hc2 = st.columns(2)
-        with hc1:
-            if st.button("Resume last", use_container_width=True):
-                vid_id, title = st.session_state.history[0]
-                play_video(vid_id, title); st.rerun()
-        with hc2:
-            if st.button("Clear history", use_container_width=True):
-                st.session_state.history = []; st.rerun()
+        if st.button("▶ Resume last", use_container_width=True):
+            vid_id, title = st.session_state.history[0]
+            play_video(vid_id, title); st.rerun()
+        if st.button("🗑 Clear history", use_container_width=True):
+            st.session_state.history = []; st.rerun()
         st.download_button("⬇ Export history.csv", data=export_history_csv(),
                            file_name="tubeplay_history.csv", mime="text/csv",
                            use_container_width=True)
