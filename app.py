@@ -19,6 +19,9 @@ from video_comments        import render_comments_panel
 from watch_stats           import record_watch_event, render_stats_dashboard
 from scheduler             import render_scheduler_panel, check_and_fire_scheduled
 from speedread_transcript  import render_speedread_panel
+from video_clipper         import render_clipper_panel
+from video_summarizer      import render_summarizer_panel
+from study_focus           import render_focus_panel
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -744,6 +747,7 @@ def export_library_json() -> bytes:
         "notes": st.session_state.video_notes,
         "timestamped_notes": st.session_state.timestamped_notes,
         "saved_playlists": st.session_state.saved_playlists,
+        "video_clips": st.session_state.video_clips,
     }
     return json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 
@@ -775,6 +779,8 @@ def import_library_json(raw: bytes) -> tuple[bool, str]:
             str(name): clean_pairs(items)
             for name, items in data["saved_playlists"].items()
         })
+        if isinstance(data.get("video_clips"), dict):
+            st.session_state.video_clips.update(data["video_clips"])
     return True, "Library imported"
 
 def import_queue_text(raw: bytes):
@@ -929,7 +935,10 @@ with st.sidebar:
     api_key = st.text_input("YouTube Data API v3 key", type="password", placeholder="AIza…", key="api_key_input")
     st.divider()
 
-    quick_tab, playlists_tab, library_tab = st.tabs(["Quick", "Playlists", "Library"])
+    quick_tab, playlists_tab, library_tab, focus_tab = st.tabs(["Quick", "Playlists", "Library", "Focus"])
+
+    with focus_tab:
+        render_focus_panel(api_key)
 
     with playlists_tab:
         st.markdown("#### Import YouTube Playlist")
@@ -1514,6 +1523,14 @@ if st.session_state.playing_id:
 
     st.divider()
 
+    # ── Clipper & Loops ──
+    with st.expander("✂️ Video Clipper & Chapters"):
+        render_clipper_panel(vid, st.session_state.playing_title)
+
+    # ── Smart Transcript Summarizer ──
+    with st.expander("⚡ Smart Transcript Summarizer"):
+        render_summarizer_panel(vid, st.session_state.transcript_cache.get(vid), api_key)
+
     # ── Comments ──
     with st.expander("💬 Comments"):
         render_comments_panel(vid, api_key)
@@ -1568,8 +1585,70 @@ with st.expander("🔥 Discover"):
 
 # ─── Search ──────────────────────────────────────────────────────────────────
 st.markdown("#### 🔍 Search YouTube")
+if not api_key:
+    st.warning("Add your free YouTube Data API v3 key in the sidebar to enable search.")
+else:
+    search_col, btn_col = st.columns([5, 1])
+    with search_col:
+        query = st.text_input("Search query", placeholder="lo-fi hip hop, coding tutorials…",
+                              label_visibility="collapsed", key="search_query")
+    with btn_col:
+        do_search = st.button("Search", use_container_width=True)
+
+    # Search filter row
+    sf1, sf2, sf3 = st.columns(3)
+    with sf1:
+        s_order = st.selectbox("Sort by", ["relevance", "date", "viewCount", "rating", "title"],
+                               index=["relevance","date","viewCount","rating","title"].index(st.session_state.search_order),
+                               key="s_order", label_visibility="collapsed")
+        if s_order != st.session_state.search_order:
+            st.session_state.search_order = s_order
+    with sf2:
+        s_type = st.selectbox("Type", ["video", "channel", "playlist"],
+                              index=["video","channel","playlist"].index(st.session_state.search_type),
+                              key="s_type", label_visibility="collapsed")
+        if s_type != st.session_state.search_type:
+            st.session_state.search_type = s_type
+    with sf3:
+        s_safe = st.checkbox("Safe search", value=st.session_state.search_safe, key="s_safe")
+        if s_safe != st.session_state.search_safe:
+            st.session_state.search_safe = s_safe
+
+    if do_search and query:
+        with st.spinner("Searching…"):
+            results, err = search_youtube(query, api_key,
+                                          order=st.session_state.search_order,
+                                          video_type=st.session_state.search_type,
+                                          safe=st.session_state.search_safe)
+        if err:
+            st.error(err)
+        elif results:
+            st.session_state.search_results = results
+        else:
             st.info("No results found.")
 
+    if st.session_state.search_results:
+        st.markdown(f"<p style='color:{MUTED};font-size:{FS_SMALL}'>Showing {len(st.session_state.search_results)} results — click ▶ to play or + to queue</p>", unsafe_allow_html=True)
+        cols = st.columns(4)
+        for i, item in enumerate(st.session_state.search_results):
+            vid_id  = item["id"]["videoId"]
+            snip    = item["snippet"]
+            thumb   = snip["thumbnails"].get("medium", snip["thumbnails"].get("default", {})).get("url", "")
+            title   = snip.get("title", "Untitled")
+            channel = snip.get("channelTitle", "")
+
+            with cols[i % 4]:
+                if thumb:
+                    st.markdown(f"""
+                    <div class="video-card">
+                      <img src="{thumb}" alt="{title}">
+                      <div class="video-card-body">
+                        <p class="video-card-title">{title}</p>
+                        <span class="video-card-meta">{channel}</span>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                short = title[:22] + "…" if len(title) > 22 else title
                 pb1, pb2, pb3 = st.columns([3, 1, 1])
                 with pb1:
                     if st.button(f"▶ {short}", key=f"play_{vid_id}", use_container_width=True):
@@ -1585,7 +1664,6 @@ st.markdown("#### 🔍 Search YouTube")
                         toggle_favorite(vid_id, title); st.rerun()
                 if st.button("⏳ Watch later", key=f"later_{vid_id}", use_container_width=True):
                     toggle_watch_later(vid_id, title); st.rerun()
-
 # ─── Info expander ───────────────────────────────────────────────────────────
 with st.expander("ℹ️ How to get a free YouTube Data API v3 key"):
     st.markdown("""
